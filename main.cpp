@@ -1,294 +1,176 @@
 // Компілятор: MinGW (стандарт C++20)
-#include <charconv>
 #include <coroutine>
-#include <cstdint>
+#include <exception>
 #include <format>
 #include <iostream>
-#include <optional>
+#include <memory>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
-#include <utility>
 
-#include <windows.h>
+using namespace std;
 
-struct Range
-{
-    long long min;
-    long long max;
+const int MIN_VALUE = 1;
+const int MAX_VALUE = 256;
+const int MAX_COUNT = 10000;
 
-    bool contains(long long value) const
-    {
-        return value >= min && value <= max;
-    }
-};
-
-constexpr int MinNumber = 1;
-constexpr int MaxNumber = 256;
-constexpr Range CountRange{1, 10000};
-constexpr Range SeedRange{0, 4294967295LL};
-
-struct Settings
-{
-    int count;
-    std::uint32_t seed;
-};
-
-class Coroutine
+class Job
 {
 public:
     struct promise_type;
-    using Handle = std::coroutine_handle<promise_type>;
+    using handle = coroutine_handle<promise_type>;
 
-    struct promise_type {
-        Coroutine get_return_object()
-        {
-            return Coroutine{Handle::from_promise(*this)};
-        }
+    void start() { coro.resume(); }
+    coroutine_handle<> get_handle() const { return coro; }
 
-        std::suspend_always initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() { throw; }
+    struct promise_type
+    {
+        auto get_return_object() { return Job{handle::from_promise(*this)}; }
+        auto initial_suspend() { return suspend_always{}; }
+        auto final_suspend() noexcept { return suspend_always{}; }
+        void return_void() {}
+        void unhandled_exception() { terminate(); }
     };
-
-    explicit Coroutine(Handle handle) : handle_(handle) {}
-
-    Coroutine(Coroutine&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
-    Coroutine(const Coroutine&) = delete;
-    Coroutine& operator=(const Coroutine&) = delete;
-    Coroutine& operator=(Coroutine&&) = delete;
-
-    ~Coroutine()
+    Job(Job const &) = delete;
+    Job &operator=(Job const &) = delete;
+    Job(Job &&other) : coro(other.coro) { other.coro = nullptr; }
+    ~Job()
     {
-        if (handle_)
-        {
-            handle_.destroy();
-        }
-    }
-
-    void resume() const
-    {
-        handle_.resume();
-    }
-
-    std::coroutine_handle<> handle() const
-    {
-        return handle_;
+        if (coro)
+            coro.destroy();
     }
 
 private:
-    Handle handle_;
+    Job(handle h) : coro(h) {}
+    handle coro;
 };
 
-struct Channel {
+struct Channel
+{
     int value = 0;
-    std::coroutine_handle<> sender;
+    coroutine_handle<> sender;
+    coroutine_handle<> receiver;
 };
 
-class TransferOnEven
+class TransferAwaiter
 {
 public:
-    TransferOnEven(int number, Channel& channel, std::coroutine_handle<> receiver)
-        : number_(number), channel_(channel), receiver_(receiver) {}
-
-    bool await_ready() const noexcept {
-        return false;
-    }
-
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> self) noexcept {
-        if (isEven())
-        {
-            return passToReceiver(self);
-        }
-        return self;
-    }
-
-    void await_resume() const noexcept {}
+    TransferAwaiter(int number, Channel &channel) : number(number), channel(channel) {}
+    bool await_ready() const noexcept { return false; }
+    coroutine_handle<> await_suspend(coroutine_handle<> h) noexcept;
+    void await_resume() noexcept {}
 
 private:
-    bool isEven() const noexcept
-    {
-        return number_ % 2 == 0;
-    }
-
-    std::coroutine_handle<> passToReceiver(std::coroutine_handle<> self) noexcept
-    {
-        channel_.value = number_;
-        channel_.sender = self;
-        return receiver_;
-    }
-
-    int number_;
-    Channel& channel_;
-    std::coroutine_handle<> receiver_;
+    int number;
+    Channel &channel;
 };
 
-class ReturnToSender {
+class ReturnAwaiter
+{
 public:
-    explicit ReturnToSender(const Channel& channel) : channel_(channel) {}
-
-    bool await_ready() const noexcept
-    {
-        return false;
-    }
-
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<>) const noexcept
-    {
-        return channel_.sender;
-    }
-
-    void await_resume() const noexcept {}
+    ReturnAwaiter(const Channel &channel) : channel(channel) {}
+    bool await_ready() const noexcept { return false; }
+    coroutine_handle<> await_suspend(coroutine_handle<> h) noexcept;
+    void await_resume() noexcept {}
 
 private:
-    const Channel& channel_;
+    const Channel &channel;
 };
 
-void printGenerated(int index, int number)
+coroutine_handle<> TransferAwaiter::await_suspend(coroutine_handle<> h) noexcept
 {
-    std::cout << std::format("[{:>5}] Генератор: {:>3}\n", index, number);
+    if (number % 2 == 0)
+    {
+        channel.value = number;
+        channel.sender = h;
+        return channel.receiver;
+    }
+    return h;
 }
 
-void printReceived(int number)
+coroutine_handle<> ReturnAwaiter::await_suspend(coroutine_handle<>) noexcept
 {
-    std::cout << std::format("              → A: {:>3}\n", number);
+    return channel.sender;
 }
 
-Coroutine generateNumbers(Settings settings, Channel& channel, std::coroutine_handle<> receiver) {
-    std::mt19937 engine(settings.seed);
-    std::uniform_int_distribution<int> distribution(MinNumber, MaxNumber);
-
-    for (int index = 1; index <= settings.count; ++index) {
-        const int number = distribution(engine);
-        printGenerated(index, number);
-        co_await TransferOnEven{number, channel, receiver};
+Job random_numbers(int count, shared_ptr<Channel> channel)
+{
+    random_device r;
+    mt19937 e(r());
+    uniform_int_distribution<int> d(MIN_VALUE, MAX_VALUE);
+    for (int i = 1; i <= count; ++i)
+    {
+        int number = d(e);
+        cout << format("[{:>5}] generated: {:>3}", i, number) << endl;
+        co_await TransferAwaiter{number, *channel};
     }
 }
 
-Coroutine printEvenNumbers(const Channel& channel)
+Job print_even(shared_ptr<Channel> channel)
 {
-    while (true) {
-        printReceived(channel.value);
-        co_await ReturnToSender{channel};
+    while (true)
+    {
+        cout << format("        A printed: {:>3}", channel->value) << endl;
+        co_await ReturnAwaiter{*channel};
     }
 }
 
-std::string_view trim(std::string_view text)
+string read_line()
 {
-    constexpr std::string_view whitespace = " \t\r\n";
-    const std::size_t first = text.find_first_not_of(whitespace);
-    if (first == std::string_view::npos) {
-        return {};
-    }
-    const std::size_t last = text.find_last_not_of(whitespace);
-    return text.substr(first, last - first + 1);
-}
-
-std::optional<long long> parseInteger(std::string_view text)
-{
-    long long value = 0;
-    const char* end = text.data() + text.size();
-    const auto [stop, error] = std::from_chars(text.data(), end, value);
-    if (error != std::errc{} || stop != end) {
-        return std::nullopt;
-    }
-    return value;
-}
-
-std::string readLine(std::string_view prompt)
-{
-    std::cout << prompt;
-    std::string line;
-    if (!std::getline(std::cin, line)) {
-        throw std::runtime_error("ввід завершився раніше, ніж було отримано всі дані");
-    }
+    string line;
+    if (!getline(cin, line))
+        throw runtime_error("input ended unexpectedly");
     return line;
 }
 
-void reportInputError(std::string_view message)
+bool parse_int(const string &line, int &value)
 {
-    std::cerr << std::format("  Помилка: {}. Спробуйте ще раз.\n", message);
+    istringstream in(line);
+    return (in >> value) && (in >> ws).eof();
 }
 
-std::optional<long long> askOptionalNumber(std::string_view label, Range range)
+int read_count()
 {
-    const std::string prompt = std::format("{} [{}..{}]: ", label, range.min, range.max);
-    while (true) {
-        const std::string line = readLine(prompt);
-        const std::string_view text = trim(line);
-        if (text.empty()) {
-            return std::nullopt;
-        }
-        const std::optional<long long> value = parseInteger(text);
-        if (!value) {
-            reportInputError(std::format("\"{}\" не є коректним цілим числом", text));
-        } else if (!range.contains(*value)) {
-            reportInputError(std::format("число має бути в межах [{}, {}]", range.min, range.max));
-        } else {
-            return value;
-        }
+    while (true)
+    {
+        cout << format("Count of numbers [1..{}]: ", MAX_COUNT);
+        string line = read_line();
+        int count = 0;
+        if (!parse_int(line, count))
+            cout << format("Error: \"{}\" is not a valid integer", line) << endl;
+        else if (count < 1 || count > MAX_COUNT)
+            cout << format("Error: count must be in [1, {}]", MAX_COUNT) << endl;
+        else
+            return count;
     }
 }
 
-long long askRequiredNumber(std::string_view label, Range range)
+void demo_even_transfer(int count)
 {
-    while (true) {
-        const std::optional<long long> value = askOptionalNumber(label, range);
-        if (value) {
-            return *value;
-        }
-        reportInputError("значення не може бути порожнім");
-    }
-}
+    cout << format("Generating {} random numbers in [{}, {}]", count, MIN_VALUE, MAX_VALUE) << endl;
+    cout << "Even numbers go to coroutine A, odd numbers resume the generator" << endl
+         << endl;
 
-std::uint32_t resolveSeed(std::optional<long long> seed)
-{
-    if (seed) {
-        return static_cast<std::uint32_t>(*seed);
-    }
-    return std::random_device{}();
-}
+    auto channel = make_shared<Channel>();
+    auto printer = print_even(channel);
+    channel->receiver = printer.get_handle();
+    auto generator = random_numbers(count, channel);
+    generator.start();
 
-Settings readSettings()
-{
-    const long long count = askRequiredNumber("Кількість чисел", CountRange);
-    const std::optional<long long> seed = askOptionalNumber("Seed (Enter — випадковий)", SeedRange);
-    return Settings{static_cast<int>(count), resolveSeed(seed)};
-}
-
-void printHeader(const Settings& settings)
-{
-    std::cout << std::format("\nГенерація {} чисел з проміжку [{}, {}], seed = {}\n",
-                             settings.count, MinNumber, MaxNumber, settings.seed);
-    std::cout << "Парні числа передаються сопрограмі A, на непарних генератор продовжує роботу.\n\n";
-}
-
-void runDemo(const Settings& settings)
-{
-    printHeader(settings);
-    Channel channel;
-    const Coroutine printer = printEvenNumbers(channel);
-    const Coroutine generator = generateNumbers(settings, channel, printer.handle());
-    generator.resume();
-    std::cout << "\nГенерацію завершено.\n";
-}
-
-void setupConsole()
-{
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
+    cout << endl
+         << "Done." << endl;
 }
 
 int main()
 {
-    setupConsole();
-
-    try {
-        runDemo(readSettings());
+    try
+    {
+        demo_even_transfer(read_count());
     }
-    catch (const std::exception& error) {
-        std::cerr << std::format("\nПомилка: {}\n", error.what());
+    catch (const exception &error)
+    {
+        cerr << format("Error: {}", error.what()) << endl;
         return 1;
     }
     return 0;
